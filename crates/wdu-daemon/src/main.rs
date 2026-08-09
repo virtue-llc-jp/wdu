@@ -2,6 +2,11 @@ mod usage;
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
+use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use wdu_storage::Store;
@@ -29,13 +34,14 @@ fn main() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run(directory: PathBuf, database: PathBuf) -> Result<()> {
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
 
-    use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-    use usage::{affected_directory, scan_tree, scan_tree_if_present};
-    use wdu_core::{FileChange, FileChangeKind};
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+    use usage::scan_tree;
 
     let directory = std::fs::canonicalize(directory)?;
+    ensure_database_outside_watch_root(&directory, &database)?;
     let initial_snapshots = scan_tree(&directory)?;
     let observed_at_unix_secs = unix_now()?;
     let mut store = Store::open(&database)?;
@@ -55,43 +61,136 @@ fn run(directory: PathBuf, database: PathBuf) -> Result<()> {
     eprintln!("watching {}", directory.display());
     eprintln!("database {}", database.display());
 
-    for result in receiver {
-        let event = result?;
-        let kind = match event.kind {
-            EventKind::Create(_) => FileChangeKind::Created,
-            EventKind::Modify(_) => FileChangeKind::Modified,
-            EventKind::Remove(_) => FileChangeKind::Removed,
-            _ => FileChangeKind::Other,
-        };
-        let observed_at_unix_secs = unix_now()?;
+    while let Ok(result) = receiver.recv() {
+        let first_event = result?;
+        let mut events = vec![first_event];
+        let deadline = Instant::now() + Duration::from_millis(100);
 
-        for path in event.paths {
-            let change = FileChange::new(path, kind, observed_at_unix_secs);
-
-            if kind == FileChangeKind::Removed
-                && store.remove_path(&change.path, observed_at_unix_secs)?
-            {
-                println!("{}", serde_json::to_string(&change)?);
-                continue;
+        loop {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                break;
             }
 
-            let Some(affected) = affected_directory(&directory, &change.path, kind) else {
-                continue;
-            };
-            if let Some(snapshots) = scan_tree_if_present(&affected)? {
-                store.synchronize_tree(&affected, &snapshots, observed_at_unix_secs)?;
-            } else if affected != directory
-                && let Some(parent) = affected.parent()
-                && let Some(snapshots) = scan_tree_if_present(parent)?
-            {
-                store.synchronize_tree(parent, &snapshots, observed_at_unix_secs)?;
+            match receiver.recv_timeout(timeout) {
+                Ok(result) => events.push(result?),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
-
-            println!("{}", serde_json::to_string(&change)?);
         }
+
+        process_event_batch(&directory, &mut store, events)?;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_database_outside_watch_root(watch_root: &Path, database: &Path) -> Result<()> {
+    let watch_root = std::fs::canonicalize(watch_root)?;
+    let database_path = if database.exists() {
+        std::fs::canonicalize(database)?
+    } else {
+        let file_name = database
+            .file_name()
+            .context("database path has no file name")?;
+        let parent = database
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::canonicalize(parent)?.join(file_name)
+    };
+
+    if database_path == watch_root || database_path.strip_prefix(&watch_root).is_ok() {
+        anyhow::bail!(
+            "database {} must be outside watch root {}",
+            database.display(),
+            watch_root.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn process_event_batch(
+    watch_root: &std::path::Path,
+    store: &mut Store,
+    events: Vec<notify::Event>,
+) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use usage::affected_directory;
+    use wdu_core::{FileChange, FileChangeKind};
+
+    let observed_at_unix_secs = unix_now()?;
+    let mut changes = BTreeMap::new();
+    for event in events {
+        let kind = match event.kind {
+            notify::EventKind::Create(_) => FileChangeKind::Created,
+            notify::EventKind::Modify(_) => FileChangeKind::Modified,
+            notify::EventKind::Remove(_) => FileChangeKind::Removed,
+            _ => FileChangeKind::Other,
+        };
+        for path in event.paths {
+            changes.insert(path, kind);
+        }
+    }
+
+    let mut affected_directories = BTreeSet::new();
+    for (path, kind) in &changes {
+        if *kind == FileChangeKind::Removed && store.remove_path(path, observed_at_unix_secs)? {
+            continue;
+        }
+
+        if let Some(directory) = affected_directory(watch_root, path, *kind) {
+            affected_directories.insert(directory);
+        }
+    }
+
+    let mut scan_roots = Vec::new();
+    for directory in affected_directories {
+        if scan_roots
+            .iter()
+            .any(|root: &std::path::PathBuf| directory.strip_prefix(root).is_ok())
+        {
+            continue;
+        }
+        scan_roots.push(directory);
+    }
+
+    for directory in scan_roots {
+        reconcile_directory(watch_root, store, &directory, observed_at_unix_secs)?;
+    }
+
+    for (path, kind) in changes {
+        let change = FileChange::new(path, kind, observed_at_unix_secs);
+        println!("{}", serde_json::to_string(&change)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_directory(
+    watch_root: &std::path::Path,
+    store: &mut Store,
+    directory: &std::path::Path,
+    observed_at_unix_secs: u64,
+) -> Result<()> {
+    use usage::scan_tree_if_present;
+
+    let mut scope = directory;
+    loop {
+        if let Some(snapshots) = scan_tree_if_present(scope)? {
+            store.synchronize_tree(scope, &snapshots, observed_at_unix_secs)?;
+            return Ok(());
+        }
+
+        if scope == watch_root {
+            return Ok(());
+        }
+        scope = scope.parent().context("affected directory has no parent")?;
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -104,4 +203,20 @@ fn unix_now() -> Result<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_database_inside_watch_root() {
+        let root = std::env::temp_dir().join(format!("wdu-daemon-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let result = ensure_database_outside_watch_root(&root, &root.join("wdu.sqlite3"));
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

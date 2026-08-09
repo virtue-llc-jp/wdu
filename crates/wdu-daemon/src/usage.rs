@@ -51,8 +51,16 @@ pub fn affected_directory(watch_root: &Path, path: &Path, kind: FileChangeKind) 
 fn scan_directory_tree(directory: &Path) -> Result<(u64, Vec<DirectorySnapshot>)> {
     let mut usage_bytes = 0_u64;
     let mut snapshots = Vec::new();
-    let entries = fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok((0, snapshots));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read directory {}", directory.display()));
+        }
+    };
 
     for entry in entries {
         let entry = match entry {
@@ -125,6 +133,46 @@ mod tests {
             affected_directory(&root, &file, FileChangeKind::Removed),
             Some(directory)
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scans_inclusive_logical_file_size_without_following_symlinks() {
+        let root = std::env::temp_dir().join(format!("wdu-scan-{}", std::process::id()));
+        let nested = root.join("data").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("root.bin"), b"1234").unwrap();
+        std::fs::write(nested.join("nested.bin"), b"123456").unwrap();
+
+        let snapshots = scan_tree(&root).unwrap();
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.directory == nested)
+                .map(|snapshot| snapshot.usage_bytes),
+            Some(6)
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.directory == root)
+                .map(|snapshot| snapshot.usage_bytes),
+            Some(10)
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("root.bin"), root.join("link.bin")).unwrap();
+            let rescanned = scan_tree(&root).unwrap();
+            assert_eq!(
+                rescanned
+                    .iter()
+                    .find(|snapshot| snapshot.directory == root)
+                    .map(|snapshot| snapshot.usage_bytes),
+                Some(10)
+            );
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }

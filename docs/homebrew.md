@@ -35,10 +35,23 @@ wdu-<version>-<target>/
 └── share/doc/wdu/
     ├── README.md
     ├── architecture.md
-    └── data-model.md
+    ├── data-model.md
+    ├── development.md
+    └── homebrew.md
 ```
 
 formula は tap 側の `Formula/w/wdu.rb` に置き、`install` は次の対応にします。
+
+release asset の SHA-256 が揃ったら、template から formula を生成します。
+
+```sh
+WDU_ARM_SHA256=<arm64-sha256> \
+WDU_INTEL_SHA256=<intel-sha256> \
+bash scripts/render-homebrew-formula.sh /path/to/homebrew-tap/Formula/w/wdu.rb
+```
+
+GitHub Release 以外に upload する場合は `WDU_RELEASE_BASE_URL` で asset の URL prefix
+を変更できます。SHA-256 を空欄にしたまま formula を配布しないでください。
 
 ```ruby
 bin.install "bin/wdu"
@@ -58,7 +71,10 @@ Homebrew の Cellar や `opt` は read-only の install 領域として扱い、
 - Homebrew service: formula の `var/` 配下、例えば `var/wdu/wdu.sqlite3`
 - 一時的な切り替え: daemon と CLI の `--database PATH`、または `WDU_DATABASE`
 
-service formula では `wdu-daemon --database var/wdu/wdu.sqlite3` のように DB パスを
-明示します。これにより Cellar 内の artifact は immutable のまま、service の状態は
-Homebrew が管理する `var/` に置けます。現時点では設定ファイルを持たないため、
-`etc/` への配置は行いません。
+service formula では `wdu-daemon var/wdu-watch --database var/wdu/wdu.sqlite3` のように
+DB と watch directory を明示します。デフォルトの service は `var/wdu-watch` を監視
+するため、対象データをそこへ置くか、tap 側の formula の service 定義を利用環境に
+合わせて変更してください。DB は watch directory の外側でなければならず、daemon も
+この構成を起動時に検証します。これにより Cellar 内の artifact は immutable のまま、
+service の状態は Homebrew が管理する `var/` に置けます。現時点では設定ファイルを
+持たないため、`etc/` への配置は行いません。

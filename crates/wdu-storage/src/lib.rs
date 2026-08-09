@@ -526,14 +526,20 @@ fn ancestor_keys(transaction: &Transaction<'_>, directory_key: &str) -> Result<V
 }
 
 fn paths_under(transaction: &Transaction<'_>, scope_key: &str) -> Result<Vec<String>> {
-    let mut statement = transaction.prepare("SELECT path FROM directory_usage")?;
+    let mut statement = transaction.prepare(
+        "WITH RECURSIVE descendants(path) AS (
+             SELECT path FROM directory_usage WHERE path = ?1
+             UNION ALL
+             SELECT child.path
+             FROM directory_usage AS child
+             JOIN descendants AS parent ON child.parent_path = parent.path
+         )
+         SELECT path FROM descendants",
+    )?;
     let paths = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map(params![scope_key], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(paths
-        .into_iter()
-        .filter(|stored_path| is_under(scope_key, stored_path))
-        .collect())
+    Ok(paths)
 }
 
 fn directory_exists(transaction: &Transaction<'_>, directory_key: &str) -> Result<bool> {
@@ -690,5 +696,52 @@ mod tests {
         assert_eq!(nested.cumulative_delta_bytes, -40);
         assert_eq!(root.current_usage_bytes, 100);
         assert_eq!(root.cumulative_delta_bytes, -100);
+    }
+
+    #[test]
+    fn synchronizing_tree_reconciles_rename_without_changing_parent_total() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .initialize_tree(
+                Path::new("/watch"),
+                &[
+                    snapshot("/watch", 10),
+                    snapshot("/watch/data", 10),
+                    snapshot("/watch/data/old.bin", 10),
+                ],
+                1,
+            )
+            .unwrap();
+
+        store
+            .synchronize_tree(
+                Path::new("/watch"),
+                &[
+                    snapshot("/watch", 10),
+                    snapshot("/watch/data", 10),
+                    snapshot("/watch/data/new.bin", 10),
+                ],
+                2,
+            )
+            .unwrap();
+
+        let old = store
+            .get_aggregate(Path::new("/watch/data/old.bin"))
+            .unwrap()
+            .unwrap();
+        let new = store
+            .get_aggregate(Path::new("/watch/data/new.bin"))
+            .unwrap()
+            .unwrap();
+        let root = store.get_aggregate(Path::new("/watch")).unwrap().unwrap();
+
+        assert!(!old.is_present);
+        assert_eq!(old.current_usage_bytes, 0);
+        assert_eq!(old.cumulative_delta_bytes, -10);
+        assert!(new.is_present);
+        assert_eq!(new.current_usage_bytes, 10);
+        assert_eq!(new.cumulative_delta_bytes, 10);
+        assert_eq!(root.current_usage_bytes, 10);
+        assert_eq!(root.cumulative_delta_bytes, 0);
     }
 }

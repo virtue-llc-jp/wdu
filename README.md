@@ -54,6 +54,9 @@ cargo run -p wdu-daemon -- /path/to/watch
 cargo run -p wdu-daemon -- /path/to/watch --database /path/to/wdu.sqlite3
 ```
 
+SQLite DB は監視対象ディレクトリの外側に置いてください。daemon は自己監視と DB の
+更新イベントによる再帰処理を防ぐため、監視対象配下の DB を拒否します。
+
 ```sh
 cargo run -p wdu-cli -- query --directory /path/to/watch
 ```

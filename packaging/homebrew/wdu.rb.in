@@ -1,0 +1,34 @@
+class Wdu < Formula
+  desc "Track cumulative directory disk-usage changes on macOS"
+  homepage "https://github.com/virtue-llc-jp/wdu"
+  version "@VERSION@"
+
+  on_arm do
+    url "@ARM_URL@"
+    sha256 "@ARM_SHA256@"
+  end
+
+  on_intel do
+    url "@INTEL_URL@"
+    sha256 "@INTEL_SHA256@"
+  end
+
+  def install
+    bin.install "bin/wdu"
+    bin.install "bin/wdu-daemon"
+    doc.install Dir["share/doc/wdu/*"]
+  end
+
+  def post_install
+    (var / "wdu").mkpath
+    (var / "wdu-watch").mkpath
+    (var / "log").mkpath
+  end
+
+  service do
+    run [opt_bin / "wdu-daemon", var / "wdu-watch", "--database", var / "wdu/wdu.sqlite3"]
+    keep_alive true
+    log_path var / "log/wdu.log"
+    error_log_path var / "log/wdu.error.log"
+  end
+end

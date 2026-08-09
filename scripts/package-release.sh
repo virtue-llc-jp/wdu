@@ -30,6 +30,8 @@ install -m 0755 "target/$target/release/wdu-daemon" \
 install -m 0644 README.md "$stage_directory/$archive_root/share/doc/wdu/README.md"
 install -m 0644 docs/architecture.md "$stage_directory/$archive_root/share/doc/wdu/architecture.md"
 install -m 0644 docs/data-model.md "$stage_directory/$archive_root/share/doc/wdu/data-model.md"
+install -m 0644 docs/development.md "$stage_directory/$archive_root/share/doc/wdu/development.md"
+install -m 0644 docs/homebrew.md "$stage_directory/$archive_root/share/doc/wdu/homebrew.md"
 
 archive_path="$dist_directory/$archive_name"
 tar -C "$stage_directory" -czf "$archive_path" "$archive_root"
