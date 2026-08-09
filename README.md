@@ -68,5 +68,7 @@ cargo run -p wdu-cli -- query --directory /path/to/watch
 Homebrew 向けの release artifact と、formula でのファイル配置は
 [`docs/homebrew.md`](docs/homebrew.md) に記載しています。
 
+今後の課題と実装順序は [`docs/roadmap.md`](docs/roadmap.md) に記録しています。
+
 設計と開発手順は [`docs/`](docs/) を参照してください。エージェント向けの作業
 ルールは [`AGENTS.md`](AGENTS.md) にまとめています。
