@@ -1,9 +1,18 @@
 # 今後の課題
 
-ここでは、現在の実装とは分離して、Homebrew で常用するためと、時間を指定した増分
-クエリを提供するための次の課題を記録します。
+ここでは、Homebrew で常用するためと、時間を指定した増分クエリを提供するための
+実装状況と残課題を記録します。
 
-## 1. Homebrew service と runtime data
+## 実装済み
+
+- `wdu-config` による TOML 設定、`WDU_CONFIG`、Homebrew/user config の探索
+- CLI と daemon で共有する `wdu-usage` scanner
+- `wdu record` による現在容量の手動記録
+- hourly bucket による時間範囲 query (`--since` / `--until`)
+- 既定 7 日より古い hourly bucket の日次圧縮
+- Homebrew formula template、設定 example、`etc`/`var`/service の配置
+
+## 残課題 1: Homebrew service と runtime data
 
 Homebrew の formula に `service do` を定義し、インストールされた daemon を
 `brew services start wdu` で起動できるようにします。`brew install` の中で無断で
@@ -29,7 +38,7 @@ DB ファイル自体は daemon の初回起動時に作成します。
 install 時に必須生成しません。ユーザーが設定を追加・編集できるよう、必要なら
 `etc/wdu/config.toml.example` を `share/doc/wdu/` に同梱します。
 
-## 2. CLI と daemon の設定共有
+## 実装済みの設定共有
 
 CLI と daemon が同じ SQLite を参照できるよう、設定読み込みを共通 crate または
 共通 module に切り出します。設定の候補は次のようにします。
@@ -52,10 +61,10 @@ hourly_retention_secs = 604800
 相対パスは config ファイルの親ディレクトリを基準に解決し、CLI と daemon で異なる
 DB を誤って開かないよう、起動時に解決済みパスを表示します。
 
-## 3. CLI による現在容量の記録
+## 実装済みの CLI による現在容量の記録
 
 daemon を動かさず、CLI から現在の使用量を測定して SQLite に書き込めるようにします。
-候補コマンドは次の形です。
+実装したコマンドは次の形です。
 
 ```sh
 wdu record --directory /Users/example/data
@@ -70,13 +79,13 @@ wdu record --directory /Users/example/data
 規則で受け付けます。CLI と daemon で測定結果がずれないよう、scanner を binary
 crate から共有 library crate へ移すことを先に行います。
 
-## 4. 時系列の増分記録
+## 実装済みの時系列増分記録
 
 現在の `directory_usage` は観測開始からの累計だけを保持するため、任意の時点以降の
 増分を知るには時間バケット表を追加します。イベントを 1 件ずつ保存するのではなく、
 変更が確定した差分を時間単位で集約します。
 
-候補スキーマは次の形です。
+実装したスキーマは次の形です。
 
 ```sql
 CREATE TABLE directory_usage_bucket (
@@ -107,7 +116,7 @@ wdu query --directory /Users/example/data --since 1760000000
 集計だけ成功して履歴が欠ける状態を作らないようにします。重複イベントは現在値との
 比較で差分 0 になるため、同じ時間バケットへ二重加算しません。
 
-## 5. 古い時系列の圧縮
+## 実装済みの古い時系列の圧縮
 
 daemon の定期処理で、現在から 1 週間以上前の hourly bucket を圧縮します。最初の
 圧縮方式は、日付単位の増分を維持するため次の形にします。
@@ -125,10 +134,9 @@ daemon の定期処理で、現在から 1 週間以上前の hourly bucket を�
 移動先への upsert 後の削除を同一 transaction で行います。圧縮中も query が一貫した
 結果を読めるよう、SQLite の transaction 境界を利用します。
 
-## 実装順序
+## 残りの実装・検証順序
 
-1. config loader を追加し、CLI と daemon の DB path 解決を共通化する。
-2. scanner を共有 library に移し、`wdu record` を追加する。
-3. hourly bucket と `--since` query を追加する。
-4. daemon の日次圧縮処理と retention 設定を追加する。
-5. Homebrew formula の service、`etc`/`var` 配置、launchd 起動を実機で検証する。
+1. release asset を arm64 と Intel の両方で作成する。
+2. 実際の GitHub Release URL と SHA-256 で tap formula を生成する。
+3. `brew audit --new`、`brew install`、`brew services start wdu` を Homebrew 環境で検証する。
+4. launchd 再起動後の daemon 復帰、権限、ログローテーションを macOS 実機で確認する。

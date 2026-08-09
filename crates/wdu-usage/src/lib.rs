@@ -1,10 +1,11 @@
+//! Filesystem scanning shared by the daemon and CLI.
+
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use wdu_core::FileChangeKind;
-use wdu_storage::DirectorySnapshot;
+use wdu_core::{DirectorySnapshot, FileChangeKind};
 
 pub fn scan_tree(root: &Path) -> Result<Vec<DirectorySnapshot>> {
     let metadata = fs::symlink_metadata(root)

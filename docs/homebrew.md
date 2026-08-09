@@ -37,7 +37,8 @@ wdu-<version>-<target>/
     ├── architecture.md
     ├── data-model.md
     ├── development.md
-    └── homebrew.md
+    ├── homebrew.md
+    └── config.toml.example
 ```
 
 formula は tap 側の `Formula/w/wdu.rb` に置き、`install` は次の対応にします。
@@ -57,6 +58,7 @@ GitHub Release 以外に upload する場合は `WDU_RELEASE_BASE_URL` で asset
 bin.install "bin/wdu"
 bin.install "bin/wdu-daemon"
 doc.install Dir["share/doc/wdu/*"]
+etc.install "share/doc/wdu/config.toml.example" => "wdu/config.toml.example"
 ```
 
 `dist/` はリポジトリへ commit せず、GitHub Release などの配布先へ upload します。
@@ -71,10 +73,9 @@ Homebrew の Cellar や `opt` は read-only の install 領域として扱い、
 - Homebrew service: formula の `var/` 配下、例えば `var/wdu/wdu.sqlite3`
 - 一時的な切り替え: daemon と CLI の `--database PATH`、または `WDU_DATABASE`
 
-service formula では `wdu-daemon var/wdu-watch --database var/wdu/wdu.sqlite3` のように
-DB と watch directory を明示します。デフォルトの service は `var/wdu-watch` を監視
-するため、対象データをそこへ置くか、tap 側の formula の service 定義を利用環境に
-合わせて変更してください。DB は watch directory の外側でなければならず、daemon も
-この構成を起動時に検証します。これにより Cellar 内の artifact は immutable のまま、
-service の状態は Homebrew が管理する `var/` に置けます。現時点では設定ファイルを
-持たないため、`etc/` への配置は行いません。
+service formula は `etc/wdu/config.toml` を `--config` で daemon に渡します。初回の
+`post_install` で `var/wdu/wdu.sqlite3` と `var/wdu-watch` を設定へ書き込み、CLI と
+daemon が同じ DB と watch root を参照します。既存の設定ファイルは上書きしません。
+DB は watch directory の外側でなければならず、daemon もこの構成を起動時に検証します。
+これにより Cellar 内の artifact は immutable のまま、service の状態は Homebrew が
+管理する `var/` に置けます。汎用的な設定 example は archive にも同梱します。

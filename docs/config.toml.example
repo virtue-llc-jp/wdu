@@ -1,0 +1,7 @@
+# Paths are resolved relative to this file when they are relative.
+# database = "../../var/wdu/wdu.sqlite3"
+# watch_root = "/Users/example/data"
+
+hourly_bucket_secs = 3600
+hourly_retention_secs = 604800
+compaction_interval_secs = 3600

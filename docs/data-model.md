@@ -94,6 +94,17 @@ CREATE TABLE directory_usage (
 
 CREATE INDEX directory_usage_parent_path_idx
     ON directory_usage(parent_path);
+
+CREATE TABLE directory_usage_bucket (
+  path TEXT NOT NULL,
+  bucket_start_unix_secs INTEGER NOT NULL,
+  granularity_secs INTEGER NOT NULL CHECK (granularity_secs > 0),
+  delta_bytes INTEGER NOT NULL,
+  PRIMARY KEY (path, bucket_start_unix_secs, granularity_secs)
+) WITHOUT ROWID;
+
+CREATE INDEX directory_usage_bucket_query_idx
+  ON directory_usage_bucket(path, granularity_secs, bucket_start_unix_secs);
 ```
 
 `path` の主キーで CLI の指定ディレクトリを直接検索し、`parent_path` を祖先更新の
@@ -120,8 +131,14 @@ SET current_usage_bytes = current_usage_bytes + :delta_bytes,
 WHERE path IN (SELECT path FROM ancestors);
 ```
 
-`since` や `until` のような任意の時間範囲の集計は、この形式だけでは復元できません。
-保存するのが最新状態と累計だけで、過去の各時点の値を捨てるためです。時間範囲クエリが
-必要になった場合だけ、日次・時間単位のスナップショット表を追加します。通常の「監視
-開始から現在まで」のクエリでは、現在の集約表だけを使う方が保存量とクエリコストを
-小さくできます。
+`directory_usage_bucket` は event 履歴ではなく、差分を時間単位でまとめた履歴です。
+通常は 3,600 秒の hourly bucket を対象ディレクトリと全祖先へ同じ値で加算します。
+`wdu query --since` は hourly と日次 bucket を合計し、指定時刻を含む bucket 全体を
+対象にします。そのため bucket の途中を指定した範囲は時間単位の近似です。
+
+現在から保持期間（既定 7 日）より古い hourly bucket は、daemon の定期処理で 86,400
+秒の日次 bucket へ upsert した後に削除します。hourly と日次の移動、古い行の削除は
+同じ transaction で行うため、圧縮の途中の状態を query から見せません。
+
+schema は SQLite の `PRAGMA user_version` で管理します。現在の schema version は 2
+で、version 1 の DB を開いた場合は bucket table だけを追加する migration を行います。

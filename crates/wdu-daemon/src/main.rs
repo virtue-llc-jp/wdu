@@ -1,5 +1,3 @@
-mod usage;
-
 use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
@@ -9,43 +7,79 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use wdu_config::{Config, LoadedConfig};
 use wdu_storage::Store;
 
 #[derive(Debug, Parser)]
 #[command(name = "wdu-daemon", about = "Watch macOS file-system changes for wdu")]
 struct Args {
     /// Directory to monitor recursively.
-    #[arg(value_name = "DIRECTORY", default_value = ".")]
-    directory: PathBuf,
+    #[arg(value_name = "DIRECTORY")]
+    directory: Option<PathBuf>,
 
     /// SQLite database path.
     #[arg(long, value_name = "PATH")]
     database: Option<PathBuf>,
+
+    /// TOML configuration path.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let database = match args.database {
-        Some(database) => database,
-        None => Store::default_database_path()?,
-    };
-    run(args.directory, database)
+    let loaded_config = LoadedConfig::load(args.config.as_deref())?;
+    let directory = args
+        .directory
+        .or_else(|| loaded_config.config.watch_root.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let database = resolve_database(&loaded_config.config, args.database)?;
+    if let Some(config_path) = &loaded_config.path {
+        eprintln!("config {}", config_path.display());
+    }
+    run(
+        directory,
+        database,
+        loaded_config.config.hourly_bucket_secs,
+        loaded_config.config.hourly_retention_secs,
+        loaded_config.config.compaction_interval_secs,
+    )
+}
+
+fn resolve_database(config: &Config, cli_database: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(database) = cli_database {
+        return Ok(database);
+    }
+    if let Some(database) = std::env::var_os("WDU_DATABASE") {
+        return Ok(PathBuf::from(database));
+    }
+    if let Some(database) = &config.database {
+        return Ok(database.clone());
+    }
+    Store::default_database_path()
 }
 
 #[cfg(target_os = "macos")]
-fn run(directory: PathBuf, database: PathBuf) -> Result<()> {
+fn run(
+    directory: PathBuf,
+    database: PathBuf,
+    hourly_bucket_secs: u64,
+    hourly_retention_secs: u64,
+    compaction_interval_secs: u64,
+) -> Result<()> {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::{Duration, Instant};
 
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-    use usage::scan_tree;
+    use wdu_usage::scan_tree;
 
     let directory = std::fs::canonicalize(directory)?;
     ensure_database_outside_watch_root(&directory, &database)?;
     let initial_snapshots = scan_tree(&directory)?;
     let observed_at_unix_secs = unix_now()?;
-    let mut store = Store::open(&database)?;
+    let mut store = Store::open_with_history(&database, hourly_bucket_secs, hourly_retention_secs)?;
     store.initialize_tree(&directory, &initial_snapshots, observed_at_unix_secs)?;
+    store.compact_history(observed_at_unix_secs)?;
 
     let (sender, receiver) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -61,8 +95,19 @@ fn run(directory: PathBuf, database: PathBuf) -> Result<()> {
     eprintln!("watching {}", directory.display());
     eprintln!("database {}", database.display());
 
-    while let Ok(result) = receiver.recv() {
-        let first_event = result?;
+    let compaction_interval = Duration::from_secs(compaction_interval_secs);
+    let mut next_compaction = Instant::now() + compaction_interval;
+    loop {
+        let timeout = next_compaction.saturating_duration_since(Instant::now());
+        let first_event = match receiver.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => {
+                store.compact_history(unix_now()?)?;
+                next_compaction = Instant::now() + compaction_interval;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let mut events = vec![first_event];
         let deadline = Instant::now() + Duration::from_millis(100);
 
@@ -79,6 +124,10 @@ fn run(directory: PathBuf, database: PathBuf) -> Result<()> {
         }
 
         process_event_batch(&directory, &mut store, events)?;
+        if Instant::now() >= next_compaction {
+            store.compact_history(unix_now()?)?;
+            next_compaction = Instant::now() + compaction_interval;
+        }
     }
 
     Ok(())
@@ -119,8 +168,8 @@ fn process_event_batch(
 ) -> Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use usage::affected_directory;
     use wdu_core::{FileChange, FileChangeKind};
+    use wdu_usage::affected_directory;
 
     let observed_at_unix_secs = unix_now()?;
     let mut changes = BTreeMap::new();
@@ -177,7 +226,7 @@ fn reconcile_directory(
     directory: &std::path::Path,
     observed_at_unix_secs: u64,
 ) -> Result<()> {
-    use usage::scan_tree_if_present;
+    use wdu_usage::scan_tree_if_present;
 
     let mut scope = directory;
     loop {
@@ -194,7 +243,13 @@ fn reconcile_directory(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run(_directory: PathBuf, _database: PathBuf) -> Result<()> {
+fn run(
+    _directory: PathBuf,
+    _database: PathBuf,
+    _hourly_bucket_secs: u64,
+    _hourly_retention_secs: u64,
+    _compaction_interval_secs: u64,
+) -> Result<()> {
     anyhow::bail!("wdu-daemon currently supports macOS only")
 }
 

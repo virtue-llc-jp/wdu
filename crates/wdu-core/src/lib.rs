@@ -31,6 +31,22 @@ impl FileChange {
     }
 }
 
+/// A recursively measured directory and its inclusive logical byte usage.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DirectorySnapshot {
+    pub directory: PathBuf,
+    pub usage_bytes: u64,
+}
+
+impl DirectorySnapshot {
+    pub fn new(directory: PathBuf, usage_bytes: u64) -> Self {
+        Self {
+            directory,
+            usage_bytes,
+        }
+    }
+}
+
 /// The materialized usage state for one directory.
 ///
 /// Both usage values include the directory's descendants. The cumulative value

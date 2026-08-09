@@ -3,7 +3,7 @@
 ## 文書一覧
 
 - [アーキテクチャ](architecture.md): crate 間の責務とイベントから記録までの流れ
-- [データモデル](data-model.md): `wdu-core` のイベント・使用量差分の形式
+- [データモデル](data-model.md): 集約、hourly bucket、SQLite の形式
 - [開発手順](development.md): セットアップ、検証、macOS 上での実行方法
 - [今後の課題](roadmap.md): Homebrew service、設定共有、CLI 記録、時系列、圧縮の計画
 

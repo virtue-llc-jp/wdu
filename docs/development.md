@@ -37,15 +37,34 @@ cargo run -p wdu-daemon -- /tmp/wdu-watch
 ディレクトリを再計算して永続化します。受信イベントは開発用に標準出力へ 1 行 1 JSON
 で出力されます。
 
+設定ファイルを指定する場合は次のようにします。`--config` を省略すると、
+`WDU_CONFIG`、Homebrew の `etc/wdu/config.toml`、ユーザー設定の順に既存ファイルを
+探します。
+
+```sh
+cargo run -p wdu-daemon -- \
+  --config /opt/homebrew/etc/wdu/config.toml
+```
+
 CLI の引数は次の形です。
 
 ```sh
 cargo run -p wdu-cli -- query \
-  --directory /tmp/wdu-watch
+  --directory /tmp/wdu-watch \
+  --since 1760000000
 ```
 
 指定ディレクトリの配下全体について、観測開始からの増減累計を JSON で返します。
-daemon と別の DB を使う場合は `--database` で同じパスを指定します。
+`--since` を指定すると hourly/daily bucket の時間範囲差分を返します。daemon と別の
+DB を使う場合は `--database` で同じパスを指定します。
+
+daemon を起動せず現在容量を記録するには次を実行します。
+
+```sh
+cargo run -p wdu-cli -- record \
+  --directory /tmp/wdu-watch \
+  --database /tmp/wdu.sqlite3
+```
 
 ## 実装時の注意
 
@@ -56,7 +75,9 @@ daemon と別の DB を使う場合は `--database` で同じパスを指定し�
   子孫行を重複して `SUM` しない。
 - 削除されたパスの `metadata` 取得失敗は通常のケースになり得るため、再計算対象の
   決定とエラーの扱いを分ける。
-- シンボリックリンクを辿る場合は循環と二重計上を防ぐ。
+- シンボリックリンクは辿らず、論理サイズを通常ファイルごとに合計する。
+- hourly bucket の更新と aggregate の更新を同じ SQLite transaction で行う。
+- 7 日より古い hourly bucket は日次 bucket へ圧縮する。
 
 Homebrew 向けの release artifact は次で作成します。
 

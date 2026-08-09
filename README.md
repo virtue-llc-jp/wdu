@@ -11,11 +11,14 @@ Rust workspace の初期実装です。現在は以下まで実装されてい�
 - 監視イベントを共有ドメインモデルへ変換
 - ディレクトリ配下全体の現在使用量と増減累計を表す共有データモデル
 - SQLite への階層累計の保存と、重複通知・削除の処理
-- 指定ディレクトリの累計を JSON で返す CLI クエリ
+- hourly/daily bucket の時系列差分保存と古い履歴の圧縮
+- 指定ディレクトリの累計・時間範囲を JSON で返す CLI クエリ
+- CLI から現在容量を測定して記録する `record` サブコマンド
 
 監視イベントは開発用に NDJSON として標準出力へ出力されます。永続化先は既定では
 macOS の `~/Library/Application Support/wdu/wdu.sqlite3` で、`--database` または
-`WDU_DATABASE` で変更できます。
+`WDU_DATABASE` で変更できます。`--config` または `WDU_CONFIG` で TOML 設定を指定
+でき、Homebrew では `$(brew --prefix)/etc/wdu/config.toml` が候補になります。
 
 ## Workspace 構成
 
@@ -24,6 +27,8 @@ macOS の `~/Library/Application Support/wdu/wdu.sqlite3` で、`--database` ま
 | `wdu-core` | `FileChange` と `DirectoryUsageAggregate` などの共有データモデル |
 | `wdu-daemon` | macOS のイベントを再帰的に監視する常駐プロセス |
 | `wdu-storage` | SQLite の階層集約ストレージ |
+| `wdu-config` | CLI と daemon が共有する TOML 設定 |
+| `wdu-usage` | CLI と daemon が共有するファイルシステム scanner |
 | `wdu-cli` | 記録済みデータを検索する CLI。バイナリ名は `wdu` |
 
 監視バックエンドは `notify` の macOS 実装（FSEvents）を使用します。OS 固有の
@@ -61,9 +66,24 @@ SQLite DB は監視対象ディレクトリの外側に置いてください。d
 cargo run -p wdu-cli -- query --directory /path/to/watch
 ```
 
+時間範囲の差分を確認するには次を実行します。
+
+```sh
+cargo run -p wdu-cli -- query \
+	--directory /path/to/watch \
+	--since 1760000000
+```
+
+現在容量を手動で測定して記録するには次を実行します。
+
+```sh
+cargo run -p wdu-cli -- record --directory /path/to/watch
+```
+
 クエリは指定ディレクトリの集約行を読み取り、観測開始から現在までの配下全体の
-増減累計を返す設計です。イベントごとの履歴は保存しないため、任意の時間範囲の
-集計は別途スナップショットを有効にした場合だけ提供します。
+増減累計を返します。`--since` を指定すると hourly/daily bucket の時間範囲差分を
+返します。event 単位では保存せず、既定では 7 日より古い hourly bucket を日次へ
+圧縮します。
 
 Homebrew 向けの release artifact と、formula でのファイル配置は
 [`docs/homebrew.md`](docs/homebrew.md) に記載しています。

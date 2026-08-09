@@ -17,18 +17,30 @@ class Wdu < Formula
     bin.install "bin/wdu"
     bin.install "bin/wdu-daemon"
     doc.install Dir["share/doc/wdu/*"]
+    etc.install "share/doc/wdu/config.toml.example" => "wdu/config.toml.example"
   end
 
   def post_install
+    (etc / "wdu").mkpath
+    config_path = etc / "wdu/config.toml"
+    unless config_path.exist?
+      config_path.write <<~EOS
+        database = "#{var}/wdu/wdu.sqlite3"
+        watch_root = "#{var}/wdu-watch"
+        hourly_bucket_secs = 3600
+        hourly_retention_secs = 604800
+        compaction_interval_secs = 3600
+      EOS
+    end
     (var / "wdu").mkpath
     (var / "wdu-watch").mkpath
-    (var / "log").mkpath
+    (var / "log/wdu").mkpath
   end
 
   service do
-    run [opt_bin / "wdu-daemon", var / "wdu-watch", "--database", var / "wdu/wdu.sqlite3"]
+    run [opt_bin / "wdu-daemon", "--config", etc / "wdu/config.toml"]
     keep_alive true
-    log_path var / "log/wdu.log"
-    error_log_path var / "log/wdu.error.log"
+    log_path var / "log/wdu/wdu.log"
+    error_log_path var / "log/wdu/wdu.error.log"
   end
 end

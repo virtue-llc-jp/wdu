@@ -1,9 +1,11 @@
 [workspace]
 members = [
     "crates/wdu-core",
+    "crates/wdu-config",
     "crates/wdu-daemon",
     "crates/wdu-cli",
     "crates/wdu-storage",
+    "crates/wdu-usage",
 ]
 resolver = "3"
 
@@ -20,5 +22,8 @@ notify = "8.2"
 rusqlite = "0.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
+wdu-config = { path = "crates/wdu-config" }
 wdu-core = { path = "crates/wdu-core" }
 wdu-storage = { path = "crates/wdu-storage" }
+wdu-usage = { path = "crates/wdu-usage" }

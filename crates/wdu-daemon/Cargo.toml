@@ -7,7 +7,9 @@ edition = "2024"
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+wdu-config = { workspace = true }
 wdu-core = { workspace = true }
+wdu-usage = { workspace = true }
 wdu-storage = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

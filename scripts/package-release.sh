@@ -32,6 +32,7 @@ install -m 0644 docs/architecture.md "$stage_directory/$archive_root/share/doc/w
 install -m 0644 docs/data-model.md "$stage_directory/$archive_root/share/doc/wdu/data-model.md"
 install -m 0644 docs/development.md "$stage_directory/$archive_root/share/doc/wdu/development.md"
 install -m 0644 docs/homebrew.md "$stage_directory/$archive_root/share/doc/wdu/homebrew.md"
+install -m 0644 docs/config.toml.example "$stage_directory/$archive_root/share/doc/wdu/config.toml.example"
 
 archive_path="$dist_directory/$archive_name"
 tar -C "$stage_directory" -czf "$archive_path" "$archive_root"

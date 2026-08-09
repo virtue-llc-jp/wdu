@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use wdu_core::DirectoryUsageAggregate;
+use wdu_core::{DirectorySnapshot, DirectoryUsageAggregate};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS store_metadata (
@@ -24,36 +24,43 @@ CREATE TABLE IF NOT EXISTS directory_usage (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS directory_usage_parent_path_idx
     ON directory_usage(parent_path);
+CREATE TABLE IF NOT EXISTS directory_usage_bucket (
+    path TEXT NOT NULL,
+    bucket_start_unix_secs INTEGER NOT NULL,
+    granularity_secs INTEGER NOT NULL CHECK (granularity_secs > 0),
+    delta_bytes INTEGER NOT NULL,
+    PRIMARY KEY (path, bucket_start_unix_secs, granularity_secs)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS directory_usage_bucket_query_idx
+    ON directory_usage_bucket(path, granularity_secs, bucket_start_unix_secs);
 "#;
 
 const WATCH_ROOT_KEY: &str = "watch_root";
-const SCHEMA_VERSION: i64 = 1;
-
-/// A recursively measured directory and its inclusive logical byte usage.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DirectorySnapshot {
-    pub directory: PathBuf,
-    pub usage_bytes: u64,
-}
-
-impl DirectorySnapshot {
-    pub fn new(directory: PathBuf, usage_bytes: u64) -> Self {
-        Self {
-            directory,
-            usage_bytes,
-        }
-    }
-}
+const HOURLY_BUCKET_KEY: &str = "hourly_bucket_secs";
+const SCHEMA_VERSION: i64 = 2;
+const DAILY_GRANULARITY_SECS: u64 = 86_400;
 
 /// Persistent store for materialized directory usage aggregates.
 pub struct Store {
     connection: Connection,
     watch_root: Option<String>,
+    hourly_bucket_secs: u64,
+    hourly_retention_secs: u64,
 }
 
 impl Store {
     /// Opens or creates a SQLite database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_history(path, 3_600, 604_800)
+    }
+
+    /// Opens or creates a SQLite database with configurable history retention.
+    pub fn open_with_history(
+        path: &Path,
+        hourly_bucket_secs: u64,
+        hourly_retention_secs: u64,
+    ) -> Result<Self> {
+        validate_history_settings(hourly_bucket_secs, hourly_retention_secs)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
@@ -62,12 +69,25 @@ impl Store {
 
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, hourly_bucket_secs, hourly_retention_secs)
     }
 
     /// Opens an in-memory store for tests and embedders.
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::open_in_memory_with_history(3_600, 604_800)
+    }
+
+    /// Opens an in-memory store with configurable history retention.
+    pub fn open_in_memory_with_history(
+        hourly_bucket_secs: u64,
+        hourly_retention_secs: u64,
+    ) -> Result<Self> {
+        validate_history_settings(hourly_bucket_secs, hourly_retention_secs)?;
+        Self::from_connection(
+            Connection::open_in_memory()?,
+            hourly_bucket_secs,
+            hourly_retention_secs,
+        )
     }
 
     /// Returns the default per-user database path.
@@ -137,6 +157,7 @@ impl Store {
                 &root_key,
                 snapshots,
                 observed_at_unix_secs,
+                self.hourly_bucket_secs,
             )?;
         }
 
@@ -166,6 +187,7 @@ impl Store {
             &directory_key,
             snapshots,
             observed_at_unix_secs,
+            self.hourly_bucket_secs,
         )?;
         transaction.commit()?;
         Ok(())
@@ -192,6 +214,7 @@ impl Store {
             current_usage_bytes,
             is_present,
             observed_at_unix_secs,
+            self.hourly_bucket_secs,
         )?;
         transaction.commit()?;
         Ok(delta)
@@ -220,6 +243,7 @@ impl Store {
                 0,
                 false,
                 observed_at_unix_secs,
+                self.hourly_bucket_secs,
             )?;
         }
 
@@ -271,7 +295,80 @@ impl Store {
         )))
     }
 
-    fn from_connection(connection: Connection) -> Result<Self> {
+    /// Returns the approximate change in the requested time range.
+    ///
+    /// Time boundaries are rounded down to the granularity of each stored bucket.
+    pub fn query_delta_since(
+        &self,
+        directory: &Path,
+        since_unix_secs: u64,
+        until_unix_secs: Option<u64>,
+    ) -> Result<i64> {
+        if let Some(until_unix_secs) = until_unix_secs
+            && until_unix_secs < since_unix_secs
+        {
+            bail!("until timestamp must not be earlier than since timestamp");
+        }
+        let directory_key = path_key(directory)?;
+        let since_unix_secs = sqlite_timestamp(since_unix_secs)?;
+        let until_unix_secs = until_unix_secs.map(sqlite_timestamp).transpose()?;
+        let delta = self.connection.query_row(
+            "SELECT COALESCE(SUM(delta_bytes), 0)
+             FROM directory_usage_bucket
+             WHERE path = ?1
+               AND bucket_start_unix_secs >=
+                   (CAST(?2 AS INTEGER) / granularity_secs) * granularity_secs
+               AND (?3 IS NULL OR bucket_start_unix_secs <=
+                   (CAST(?3 AS INTEGER) / granularity_secs) * granularity_secs)",
+            params![directory_key, since_unix_secs, until_unix_secs],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(delta)
+    }
+
+    /// Compacts hourly history older than the configured retention into daily buckets.
+    pub fn compact_history(&mut self, now_unix_secs: u64) -> Result<u64> {
+        let cutoff_unix_secs = now_unix_secs.saturating_sub(self.hourly_retention_secs);
+        let cutoff_unix_secs = sqlite_timestamp(cutoff_unix_secs)?;
+        let hourly_bucket_secs = sqlite_timestamp(self.hourly_bucket_secs)?;
+        let daily_granularity_secs = sqlite_timestamp(DAILY_GRANULARITY_SECS)?;
+        let transaction = self.connection.transaction()?;
+        let moved = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM directory_usage_bucket
+             WHERE granularity_secs = ?1 AND bucket_start_unix_secs < ?2",
+            params![hourly_bucket_secs, cutoff_unix_secs],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        transaction.execute(
+            "INSERT INTO directory_usage_bucket
+                 (path, bucket_start_unix_secs, granularity_secs, delta_bytes)
+             SELECT path,
+                    (bucket_start_unix_secs / ?2) * ?2,
+                    ?2,
+                    SUM(delta_bytes)
+             FROM directory_usage_bucket
+             WHERE granularity_secs = ?1 AND bucket_start_unix_secs < ?3
+             GROUP BY path, (bucket_start_unix_secs / ?2) * ?2
+             ON CONFLICT(path, bucket_start_unix_secs, granularity_secs)
+             DO UPDATE SET delta_bytes = delta_bytes + excluded.delta_bytes",
+            params![hourly_bucket_secs, daily_granularity_secs, cutoff_unix_secs],
+        )?;
+        transaction.execute(
+            "DELETE FROM directory_usage_bucket
+             WHERE granularity_secs = ?1 AND bucket_start_unix_secs < ?2",
+            params![hourly_bucket_secs, cutoff_unix_secs],
+        )?;
+        transaction.commit()?;
+        u64::try_from(moved).context("compacted bucket count is negative")
+    }
+
+    fn from_connection(
+        connection: Connection,
+        hourly_bucket_secs: u64,
+        hourly_retention_secs: u64,
+    ) -> Result<Self> {
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;
@@ -282,7 +379,21 @@ impl Store {
         match schema_version {
             0 => {
                 connection.execute_batch(SCHEMA)?;
-                connection.execute_batch("PRAGMA user_version = 1;")?;
+                connection.execute_batch("PRAGMA user_version = 2;")?;
+            }
+            1 => {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS directory_usage_bucket (
+                         path TEXT NOT NULL,
+                         bucket_start_unix_secs INTEGER NOT NULL,
+                         granularity_secs INTEGER NOT NULL CHECK (granularity_secs > 0),
+                         delta_bytes INTEGER NOT NULL,
+                         PRIMARY KEY (path, bucket_start_unix_secs, granularity_secs)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX IF NOT EXISTS directory_usage_bucket_query_idx
+                         ON directory_usage_bucket(path, granularity_secs, bucket_start_unix_secs);
+                     PRAGMA user_version = 2;",
+                )?;
             }
             SCHEMA_VERSION => connection.execute_batch(SCHEMA)?,
             version => bail!("unsupported SQLite schema version: {version}"),
@@ -296,9 +407,35 @@ impl Store {
             )
             .optional()?;
 
+        let stored_hourly_bucket_secs = connection
+            .query_row(
+                "SELECT value FROM store_metadata WHERE key = ?1",
+                params![HOURLY_BUCKET_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(stored_hourly_bucket_secs) = stored_hourly_bucket_secs {
+            let stored_hourly_bucket_secs =
+                stored_hourly_bucket_secs.parse::<u64>().with_context(|| {
+                    format!("stored {HOURLY_BUCKET_KEY} is not an unsigned integer")
+                })?;
+            if stored_hourly_bucket_secs != hourly_bucket_secs {
+                bail!(
+                    "database uses hourly bucket size {stored_hourly_bucket_secs}, requested {hourly_bucket_secs}"
+                );
+            }
+        } else {
+            connection.execute(
+                "INSERT INTO store_metadata (key, value) VALUES (?1, ?2)",
+                params![HOURLY_BUCKET_KEY, hourly_bucket_secs.to_string()],
+            )?;
+        }
+
         Ok(Self {
             connection,
             watch_root,
+            hourly_bucket_secs,
+            hourly_retention_secs,
         })
     }
 }
@@ -335,6 +472,7 @@ fn synchronize_tree(
     scope_key: &str,
     snapshots: &[DirectorySnapshot],
     observed_at_unix_secs: u64,
+    hourly_bucket_secs: u64,
 ) -> Result<()> {
     let mut snapshot_keys = HashSet::new();
     for snapshot in snapshots {
@@ -360,6 +498,7 @@ fn synchronize_tree(
             0,
             false,
             observed_at_unix_secs,
+            hourly_bucket_secs,
         )?;
     }
 
@@ -374,6 +513,7 @@ fn synchronize_tree(
             snapshot.usage_bytes,
             true,
             observed_at_unix_secs,
+            hourly_bucket_secs,
         )?;
     }
 
@@ -387,29 +527,27 @@ fn observe_directory_tx(
     current_usage_bytes: u64,
     is_present: bool,
     observed_at_unix_secs: u64,
+    hourly_bucket_secs: u64,
 ) -> Result<i64> {
     if !is_under(root_key, directory_key) {
         bail!("directory {directory_key} is outside watch root {root_key}");
     }
 
     let current_usage_bytes = sqlite_bytes(current_usage_bytes)?;
-    let observed_at_unix_secs = sqlite_timestamp(observed_at_unix_secs)?;
+    let observed_at_unix_secs_sqlite = sqlite_timestamp(observed_at_unix_secs)?;
     ensure_path_rows(transaction, root_key, directory_key)?;
 
-    let (previous_usage_bytes, previous_cumulative_delta_bytes) = transaction.query_row(
+    let previous_usage_bytes = transaction.query_row(
         "SELECT current_usage_bytes, cumulative_delta_bytes
          FROM directory_usage WHERE path = ?1",
         params![directory_key],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        |row| row.get::<_, i64>(0),
     )?;
     let delta_bytes = current_usage_bytes
         .checked_sub(previous_usage_bytes)
         .context("directory usage delta overflowed i64")?;
-    previous_cumulative_delta_bytes
-        .checked_add(delta_bytes)
-        .context("directory cumulative delta overflowed i64")?;
-
-    for ancestor_key in ancestor_keys(transaction, directory_key)? {
+    let ancestors = ancestor_keys(transaction, directory_key)?;
+    for ancestor_key in &ancestors {
         let (ancestor_usage_bytes, ancestor_cumulative_delta_bytes) = transaction.query_row(
             "SELECT current_usage_bytes, cumulative_delta_bytes
              FROM directory_usage WHERE path = ?1",
@@ -427,6 +565,18 @@ fn observe_directory_tx(
             .context("ancestor cumulative delta overflowed i64")?;
     }
 
+    if delta_bytes != 0 {
+        for ancestor_key in &ancestors {
+            upsert_history_bucket(
+                transaction,
+                ancestor_key,
+                observed_at_unix_secs,
+                hourly_bucket_secs,
+                delta_bytes,
+            )?;
+        }
+    }
+
     transaction.execute(
         "WITH RECURSIVE ancestors(path) AS (
              SELECT ?1
@@ -439,9 +589,9 @@ fn observe_directory_tx(
          UPDATE directory_usage
          SET current_usage_bytes = current_usage_bytes + ?2,
              cumulative_delta_bytes = cumulative_delta_bytes + ?2,
-             observed_at_unix_secs = ?3
+               observed_at_unix_secs = ?3
          WHERE path IN (SELECT path FROM ancestors)",
-        params![directory_key, delta_bytes, observed_at_unix_secs],
+        params![directory_key, delta_bytes, observed_at_unix_secs_sqlite],
     )?;
     transaction.execute(
         "UPDATE directory_usage SET is_present = ?1 WHERE path = ?2",
@@ -449,6 +599,30 @@ fn observe_directory_tx(
     )?;
 
     Ok(delta_bytes)
+}
+
+fn upsert_history_bucket(
+    transaction: &Transaction<'_>,
+    path: &str,
+    observed_at_unix_secs: u64,
+    granularity_secs: u64,
+    delta_bytes: i64,
+) -> Result<()> {
+    let bucket_start_unix_secs = (observed_at_unix_secs / granularity_secs) * granularity_secs;
+    transaction.execute(
+        "INSERT INTO directory_usage_bucket
+             (path, bucket_start_unix_secs, granularity_secs, delta_bytes)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path, bucket_start_unix_secs, granularity_secs)
+         DO UPDATE SET delta_bytes = delta_bytes + excluded.delta_bytes",
+        params![
+            path,
+            sqlite_timestamp(bucket_start_unix_secs)?,
+            sqlite_timestamp(granularity_secs)?,
+            delta_bytes
+        ],
+    )?;
+    Ok(())
 }
 
 fn ensure_path_rows(
@@ -606,6 +780,16 @@ fn sqlite_timestamp(timestamp: u64) -> Result<i64> {
     i64::try_from(timestamp).context("observation time is too large for SQLite INTEGER")
 }
 
+fn validate_history_settings(hourly_bucket_secs: u64, hourly_retention_secs: u64) -> Result<()> {
+    if hourly_bucket_secs == 0 || hourly_bucket_secs >= DAILY_GRANULARITY_SECS {
+        bail!("hourly bucket must be greater than zero and less than one day");
+    }
+    if hourly_retention_secs < hourly_bucket_secs {
+        bail!("hourly retention must be at least one bucket");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,5 +927,81 @@ mod tests {
         assert_eq!(new.cumulative_delta_bytes, 10);
         assert_eq!(root.current_usage_bytes, 10);
         assert_eq!(root.cumulative_delta_bytes, 0);
+    }
+
+    #[test]
+    fn records_hourly_deltas_for_the_target_and_ancestors() {
+        let mut store = Store::open_in_memory_with_history(3_600, 7_200).unwrap();
+        store
+            .initialize_tree(
+                Path::new("/watch"),
+                &[snapshot("/watch", 0), snapshot("/watch/data", 0)],
+                1,
+            )
+            .unwrap();
+
+        store
+            .observe_directory(Path::new("/watch/data"), 30, true, 3_601)
+            .unwrap();
+        store
+            .observe_directory(Path::new("/watch/data"), 20, true, 7_201)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .query_delta_since(Path::new("/watch"), 3_600, None)
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            store
+                .query_delta_since(Path::new("/watch/data"), 3_600, Some(3_600))
+                .unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn compacts_old_hourly_buckets_into_daily_buckets() {
+        let mut store = Store::open_in_memory_with_history(3_600, 3_600).unwrap();
+        store
+            .initialize_tree(Path::new("/watch"), &[snapshot("/watch", 0)], 1)
+            .unwrap();
+        store
+            .observe_directory(Path::new("/watch"), 10, true, 3_601)
+            .unwrap();
+        store
+            .observe_directory(Path::new("/watch"), 15, true, 7_201)
+            .unwrap();
+
+        assert_eq!(store.compact_history(9_000).unwrap(), 1);
+        assert_eq!(
+            store
+                .query_delta_since(Path::new("/watch"), 0, None)
+                .unwrap(),
+            15
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_bucket_granularity_and_invalid_range() {
+        let store = Store::open_in_memory_with_history(3_600, 7_200).unwrap();
+        assert!(
+            store
+                .query_delta_since(Path::new("/watch"), 10, Some(9))
+                .is_err()
+        );
+
+        let database = std::env::temp_dir().join(format!(
+            "wdu-storage-settings-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(Store::open_with_history(&database, 3_600, 7_200).unwrap());
+        assert!(Store::open_with_history(&database, 7_200, 7_200).is_err());
+        std::fs::remove_file(database).unwrap();
     }
 }
