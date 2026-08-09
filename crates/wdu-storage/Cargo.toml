@@ -1,0 +1,9 @@
+[package]
+name = "wdu-storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+wdu-core = { workspace = true }
